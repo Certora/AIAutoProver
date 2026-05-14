@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-autoprover"
+version = "0.1.0"
+description = "AI Autoprover — a tool for generating specifications from implementations"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [
+    {name = "Certora Ltd."}
+]
+
+dependencies = [
+    "ai-composer[ml,prover] @ git+ssh://git@github.com/Certora/AIComposer.git@ba7a9ff6bdaaef1ef2c376ae2acffff24a8a8057",
+    "certora-autosetup @ git+ssh://git@github.com/Certora/Autosetup.git@955854424e036fe395042705f923c21b6534be37"
+]
+
+[project.scripts]
+console-autoprove = "ai_autoprover.cli.console_autoprove:main"
+tui-autoprove = "ai_autoprover.cli.tui_autoprove:main"
+
+[tool.setuptools.packages.find]
+include = ["ai_autoprover*"]

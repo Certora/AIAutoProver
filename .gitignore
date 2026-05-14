@@ -1,0 +1,8 @@
+**/.DS_Store
+*.pyc
+.certora_internal/
+*.db*
+.venv/
+build/
+*.egg-info/
+
