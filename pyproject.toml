@@ -14,8 +14,8 @@ authors = [
 ]
 
 dependencies = [
-    "ai-composer[ml,prover] @ git+ssh://git@github.com/Certora/AIComposer.git@ba7a9ff6bdaaef1ef2c376ae2acffff24a8a8057",
-    "certora-autosetup @ git+ssh://git@github.com/Certora/Autosetup.git@955854424e036fe395042705f923c21b6534be37",
+    "ai-composer[ml,prover] @ git+ssh://git@github.com/Certora/AIComposer.git@composer-stable",
+    "certora-autosetup @ git+ssh://git@github.com/Certora/Autosetup.git@546a88f42b133035e6e5467bc3b6033134cf9280",
     "langchain-core<1.3.3"
 ]
 
