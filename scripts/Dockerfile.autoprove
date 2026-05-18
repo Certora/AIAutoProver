@@ -87,12 +87,13 @@ RUN mkdir -p /etc/apt/keyrings \
  && apt-get install -y --no-install-recommends temurin-21-jre \
  && rm -rf /var/lib/apt/lists/*
 
-# Solidity compiler 0.8.29 (the version the pipeline currently uses). The
-# LLM is prompted to invoke `solcX.Y`, so publish the static binary under
-# both names.
-RUN curl -fsSL https://github.com/ethereum/solidity/releases/download/v0.8.29/solc-static-linux \
-        -o /usr/local/bin/solc8.29 \
- && chmod 0755 /usr/local/bin/solc8.29 \
+# Solidity compilers. Clone Certora/cvt-executables-linux via the forwarded
+# SSH agent and copy out every solc* binary it ships.
+RUN --mount=type=ssh \
+    git clone --depth 1 git@github.com:Certora/cvt-executables-linux.git /tmp/cvt-solc \
+ && cp /tmp/cvt-solc/solc* /usr/local/bin/ \
+ && chmod 0755 /usr/local/bin/solc* \
+ && rm -rf /tmp/cvt-solc \
  && ln -sf /usr/local/bin/solc8.29 /usr/local/bin/solc
 
 WORKDIR $AUTOPROVE_HOME
