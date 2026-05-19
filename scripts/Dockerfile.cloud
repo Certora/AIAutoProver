@@ -1,16 +1,22 @@
 # syntax=docker/dockerfile:1.7
 #
-# Container for the AI Autoprover (console mode) execution path.
+# Container for AI Autoprover's CLOUD execution path — `s3-autoprove`
+# driven by AUTOPROVER_* environment variables; inputs and outputs may
+# live in S3. For the bind-mount local variant see scripts/Dockerfile.local.
+#
+# Installs ai-autoprover WITH the `[s3]` extra so smart_open[s3] +
+# pydantic-settings (+ boto3 transitively) are available. AWS credentials
+# follow boto3's standard chain (env vars, attached IAM role, ~/.aws).
 #
 # Build (BuildKit required — uses --mount=type=ssh to clone Certora repos):
 #   DOCKER_BUILDKIT=1 docker buildx build --ssh default \
-#       -t aiautoprover -f scripts/Dockerfile.autoprove .
+#       -t aiautoprover-cloud -f scripts/Dockerfile.cloud .
 #
 # Or via compose:
-#   docker compose -f scripts/docker-compose.yml --profile autoprove build
+#   docker compose -f scripts/docker-compose.cloud.yml --profile autoprove build
 #
-# Cloud prover only — the container does not bundle a local prover build.
-# CERTORAKEY must be supplied at runtime.
+# Cloud Certora Prover only — the container does not bundle a local prover
+# build. CERTORAKEY must be supplied at runtime.
 
 # ---- Stage 1: build prover documentation HTML for the RAG DB ----
 FROM python:3.12-slim AS docs-builder
@@ -49,15 +55,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/opt/autoprove/home \
     HF_HOME=/opt/autoprove/home/.cache/huggingface
 
-# Shared HOME for runtime caches (HF model, etc.). World-readable (not
-# world-writable, so SSH client is happy with ~/.ssh perms during build).
-RUN mkdir -p $HOME/.cache/huggingface \
- && chmod -R go+rX $HOME
+# HOME for runtime caches (HF model, etc.). Created up front so subsequent
+# build steps (HF model bake) can populate it; ownership is fixed to the
+# nonroot user near the end of the build.
+RUN mkdir -p $HOME/.cache/huggingface
 
-# System deps for the runtime stage. openssh-client + git for the build-time
-# SSH clones, gnupg transiently for the Adoptium key, curl for direct binary
-# downloads (solc, uv-not-needed-here). build-essential is briefly present so
-# any pip dep that needs a build (rare with [binary] wheels) can compile.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       git ca-certificates openssh-client \
@@ -67,17 +69,9 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p -m 0700 /root/.ssh \
  && ssh-keyscan github.com >> /root/.ssh/known_hosts
-# postgresql-client provides `psql`, which the entrypoint's setup-db
-# subcommand uses to run AIComposer's init-db.sql against the postgres
-# service. AIComposer ships init-db.sql as package-data so it's available
-# inside this image once pip installs ai-composer transitively.
-# known_hosts goes to /root/.ssh, NOT $HOME/.ssh — openssh's ssh client uses
-# getpwuid() to find HOME during build (as root), so it reads /root/.ssh
-# regardless of our ENV HOME. SSH is build-time only.
 
 # Java 21 (Temurin JRE) — certora_cli uses it for local CVL spec syntax
-# checking before uploading to the cloud. Debian Bookworm ships only
-# openjdk-17 and we need >= 19, so install via the Adoptium apt repo.
+# checking before uploading to the cloud prover.
 RUN mkdir -p /etc/apt/keyrings \
  && curl -fsSL https://packages.adoptium.net/artifactory/api/gpg/key/public \
       | gpg --dearmor -o /etc/apt/keyrings/adoptium.gpg \
@@ -98,23 +92,19 @@ RUN --mount=type=ssh \
 
 WORKDIR $AUTOPROVE_HOME
 
-# Bake the AI Autoprover source (build context = repo root) and install it.
-# This pulls ai-composer[ml,prover] @ composer-stable and certora-autosetup
-# transitively via the pinned URLs in pyproject.toml — no separate clones
-# of Autosetup/PreAudit, no manual prover-output-utility commit pinning.
+# Bake the AI Autoprover source (build context = repo root) and install it
+# WITH the `[s3]` extra — pulls pydantic-settings + smart_open[s3] for the
+# AUTOPROVER_* driven entry point.
 COPY . $AUTOPROVE_HOME/AIAutoProver
 
 RUN python -m venv $VIRTUAL_ENV \
  && pip install --upgrade pip wheel setuptools
 
 RUN --mount=type=ssh \
-    pip install -e "$AUTOPROVE_HOME/AIAutoProver"
+    pip install -e "$AUTOPROVE_HOME/AIAutoProver[s3]"
 
 # Extras the setup-db `composer.scripts.ragbuild` invocation needs (spacy +
-# bs4 + en_core_web_sm). Pinned versions match AIComposer's pyproject
-# [dependency-groups.ragbuild]; we install them at the top level so we can
-# invoke ragbuild with the venv's python directly — no uv runtime build,
-# no extra editable install dance.
+# bs4 + en_core_web_sm). Same set as in Dockerfile.local.
 RUN pip install \
     spacy==3.8.7 \
     beautifulsoup4==4.13.5 \
@@ -123,38 +113,36 @@ RUN pip install \
 # Pre-built CVL/prover HTML — ragbuild reads from here for the RAG DB.
 COPY --from=docs-builder /out/ $AUTOPROVE_HOME/prover-docs/
 
-# Pre-download the sentence-transformers embedding model so first runs are
-# offline-fast. nomic-embed-text-v1.5 ships custom modeling code, hence
-# trust_remote_code. Then chmod the cache subtree world-writable so the HF
-# library can drop `.no_exist` marker files at runtime.
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('nomic-ai/nomic-embed-text-v1.5', trust_remote_code=True)" \
- && chmod -R go+rwX $HF_HOME
+# Pre-download the sentence-transformers embedding model. trust_remote_code
+# is required because nomic-embed-text-v1.5 ships custom modeling code.
+# Ownership/perms come from the chown step below — no chmod gymnastics
+# needed since the container runs as a fixed UID we control.
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('nomic-ai/nomic-embed-text-v1.5', trust_remote_code=True)"
 
-# Trim build tooling now that wheels are installed.
 RUN apt-get purge -y build-essential libffi-dev curl gnupg \
  && apt-get autoremove -y \
  && rm -rf /var/lib/apt/lists/*
 
-# Database host/port assume the compose-managed postgres service; override
-# per-run if needed.
+# Postgres host/port for the standard compose setup; overridden by the
+# orchestrator when pointing at a managed DB (e.g. RDS).
 ENV CERTORA_AI_COMPOSER_PGHOST=postgres \
     CERTORA_AI_COMPOSER_PGPORT=5432
 
 COPY scripts/autoprove-entrypoint.sh /usr/local/bin/autoprove-entrypoint
 RUN chmod +x /usr/local/bin/autoprove-entrypoint
 
-# Final perms: make every baked thing under /opt/autoprove world-readable
-# so the runtime user (host UID supplied by compose) can read source, venv,
-# and HF cache. Also make /etc/passwd and /etc/group world-writable so the
-# entrypoint can append a synthetic passwd entry for whatever host UID the
-# container runs as — without it, libraries that call pwd.getpwuid() (e.g.
-# torch via getpass.getuser()) crash with `KeyError: 'getpwuid()'`. Done
-# LAST because earlier apt operations (notably the Temurin install creating
-# a system group) rewrite /etc/group and reset its perms.
-RUN chmod -R go+rX $AUTOPROVE_HOME \
- && chmod 0666 /etc/passwd /etc/group
+# Create a fixed non-root user (UID 65532 — the distroless convention) and
+# hand it ownership of everything the runtime needs. With a known UID baked
+# in we don't need the local image's chmod 0666 /etc/passwd trick — the
+# entrypoint's passwd-patch step finds UID 65532 already in /etc/passwd
+# and skips. /workspace is provided as a safe writable cwd for the runtime.
+RUN groupadd --system --gid 65532 nonroot \
+ && useradd  --system --uid 65532 --gid 65532 --no-create-home nonroot \
+ && mkdir -p /workspace \
+ && chown -R nonroot:nonroot $AUTOPROVE_HOME /workspace
 
-WORKDIR /work
+USER nonroot
+WORKDIR /workspace
 
 ENTRYPOINT ["/usr/local/bin/autoprove-entrypoint"]
-CMD ["console-autoprove", "--help"]
+CMD ["s3-autoprove"]

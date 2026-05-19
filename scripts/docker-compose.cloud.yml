@@ -1,0 +1,111 @@
+# docker-compose.cloud.yml — CLOUD/S3 flow (intended for local testing
+# of the s3-autoprove path)
+#
+# Pairs with scripts/Dockerfile.cloud. The autoprove service reads
+# AUTOPROVER_* env vars to decide where to fetch contract sources and
+# the design doc (local paths or s3:// URLs) and where to push results.
+# `console-autoprove` is still available in this image but its bind-mount
+# ergonomics aren't wired in here — use docker-compose.local.yml for that.
+#
+# Real cloud deployments don't go through compose at all (K8s/ECS will
+# bring up the autoprover image directly, with postgres = a managed RDS
+# instance pointed at via CERTORA_AI_COMPOSER_PG{HOST,PORT}). This file
+# is here so you can exercise the s3-autoprove code path against a local
+# postgres before shipping anywhere.
+#
+# Usage:
+#   docker compose -f scripts/docker-compose.cloud.yml up -d postgres
+#   docker compose -f scripts/docker-compose.cloud.yml --profile autoprove \
+#       run --rm autoprove setup-db        # one-time DB seed
+#
+#   export ANTHROPIC_API_KEY=... CERTORAKEY=...
+#   export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=...
+#   export AUTOPROVER_CONTRACT_PATH=src/Vault.sol
+#   export AUTOPROVER_CONTRACT_NAME=Vault
+#   export AUTOPROVER_DESIGN_MD_PATH=s3://bucket/runs/abc/design.md
+#   export AUTOPROVER_SOURCES_DIR=/tmp/sources
+#   export AUTOPROVER_SOURCES_ZIP_URL=s3://bucket/runs/abc/sources.zip
+#   export AUTOPROVER_RESULTS_DIR=s3://bucket/runs/abc/results
+#   docker compose -f scripts/docker-compose.cloud.yml --profile autoprove \
+#       run --rm autoprove
+#
+# For local AIComposer iteration overlay scripts/docker-compose.dev.yml.
+name: autoprover-cloud
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_admin_password
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    command: |
+      postgres
+      -c shared_buffers=256MB
+      -c effective_cache_size=1GB
+      -c maintenance_work_mem=64MB
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=16MB
+      -c default_statistics_target=100
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c work_mem=4MB
+      -c max_connections=50
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  autoprove:
+    profiles: ["autoprove"]
+    image: aiautoprover-cloud:latest
+    build:
+      context: ..
+      dockerfile: scripts/Dockerfile.cloud
+      ssh:
+        - default
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Image runs as the baked-in `nonroot` user (UID 65532); no `user:`
+    # override. This trades flexibility for simplicity — orchestrators
+    # that want a different UID would need to rebuild the image with a
+    # different bake target. /etc/passwd is NOT world-writable here, so
+    # the entrypoint can't synthesize a passwd entry for unknown UIDs.
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY must be set in your shell}
+      CERTORAKEY: ${CERTORAKEY:-}
+      CERTORA_AI_COMPOSER_PGHOST: postgres
+      CERTORA_AI_COMPOSER_PGPORT: "5432"
+      # AWS credential chain — boto3 / smart_open pick these up for s3://
+      # access. For real cloud deployments these typically come from IRSA
+      # / instance metadata and don't need explicit values.
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-}
+      # AUTOPROVER_* settings drive `s3-autoprove`. pydantic-settings reads
+      # them at run time; empty values cause a ValidationError on launch.
+      AUTOPROVER_CONTRACT_PATH: ${AUTOPROVER_CONTRACT_PATH:-}
+      AUTOPROVER_CONTRACT_NAME: ${AUTOPROVER_CONTRACT_NAME:-}
+      AUTOPROVER_DESIGN_MD_PATH: ${AUTOPROVER_DESIGN_MD_PATH:-}
+      AUTOPROVER_SOURCES_DIR: ${AUTOPROVER_SOURCES_DIR:-}
+      AUTOPROVER_SOURCES_ZIP_URL: ${AUTOPROVER_SOURCES_ZIP_URL:-}
+      AUTOPROVER_RESULTS_DIR: ${AUTOPROVER_RESULTS_DIR:-}
+
+volumes:
+  postgres_data:

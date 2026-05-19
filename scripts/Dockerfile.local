@@ -1,0 +1,167 @@
+# syntax=docker/dockerfile:1.7
+#
+# Container for AI Autoprover's LOCAL execution path — `console-autoprove`
+# against a bind-mounted host project. For the S3-driven cloud variant see
+# scripts/Dockerfile.cloud.
+#
+# Installs ai-autoprover WITHOUT the `[s3]` extra; the boto3/smart_open
+# baggage isn't needed when inputs and outputs are local files on a bind
+# mount. `s3-autoprove` is still registered as a console script and will
+# ImportError at invocation time if anyone calls it from this image.
+#
+# Build (BuildKit required — uses --mount=type=ssh to clone Certora repos):
+#   DOCKER_BUILDKIT=1 docker buildx build --ssh default \
+#       -t aiautoprover-local -f scripts/Dockerfile.local .
+#
+# Or via compose:
+#   docker compose -f scripts/docker-compose.local.yml --profile autoprove build
+#
+# Cloud Certora Prover only — the container does not bundle a local prover
+# build. CERTORAKEY must be supplied at runtime.
+
+# ---- Stage 1: build prover documentation HTML for the RAG DB ----
+FROM python:3.12-slim AS docs-builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates openssh-client \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p -m 0700 /root/.ssh \
+ && ssh-keyscan github.com >> /root/.ssh/known_hosts
+
+WORKDIR /build
+RUN --mount=type=ssh \
+    git clone --depth 1 git@github.com:Certora/Documentation.git docs
+
+RUN python -m venv /venv \
+ && /venv/bin/pip install --no-cache-dir -r /build/docs/requirements.txt
+
+RUN set -eux; \
+    mkdir -p /out; \
+    for target in /build/docs/docs/cvl /build/docs/docs/solana /build/docs/docs/prover /build/docs/docs/user-guide; do \
+      cp /build/docs/conf.py "$target/"; \
+      ( cd "$target" && /venv/bin/sphinx-build -M singlehtml . tmp ); \
+      cp "$target/tmp/singlehtml/index.html" "/out/$(basename "$target").html"; \
+    done
+
+# ---- Stage 2: final runtime image ----
+FROM python:3.12-slim AS final
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    AUTOPROVE_HOME=/opt/autoprove \
+    VIRTUAL_ENV=/opt/autoprove/venv \
+    PATH=/opt/autoprove/venv/bin:/usr/local/bin:/usr/bin:/bin \
+    HOME=/opt/autoprove/home \
+    HF_HOME=/opt/autoprove/home/.cache/huggingface
+
+# Shared HOME for runtime caches (HF model, etc.). World-readable (not
+# world-writable, so SSH client is happy with ~/.ssh perms during build).
+RUN mkdir -p $HOME/.cache/huggingface \
+ && chmod -R go+rX $HOME
+
+# System deps for the runtime stage. openssh-client + git for the build-time
+# SSH clones, gnupg transiently for the Adoptium key, curl for direct binary
+# downloads (solc, uv-not-needed-here). build-essential is briefly present so
+# any pip dep that needs a build (rare with [binary] wheels) can compile.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      git ca-certificates openssh-client \
+      build-essential libffi-dev \
+      curl gnupg \
+      postgresql-client \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p -m 0700 /root/.ssh \
+ && ssh-keyscan github.com >> /root/.ssh/known_hosts
+# postgresql-client provides `psql`, which the entrypoint's setup-db
+# subcommand uses to run AIComposer's init-db.sql against the postgres
+# service. AIComposer ships init-db.sql as package-data so it's available
+# inside this image once pip installs ai-composer transitively.
+# known_hosts goes to /root/.ssh, NOT $HOME/.ssh — openssh's ssh client uses
+# getpwuid() to find HOME during build (as root), so it reads /root/.ssh
+# regardless of our ENV HOME. SSH is build-time only.
+
+# Java 21 (Temurin JRE) — certora_cli uses it for local CVL spec syntax
+# checking before uploading to the cloud. Debian Bookworm ships only
+# openjdk-17 and we need >= 19, so install via the Adoptium apt repo.
+RUN mkdir -p /etc/apt/keyrings \
+ && curl -fsSL https://packages.adoptium.net/artifactory/api/gpg/key/public \
+      | gpg --dearmor -o /etc/apt/keyrings/adoptium.gpg \
+ && echo "deb [signed-by=/etc/apt/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb $(. /etc/os-release && echo $VERSION_CODENAME) main" \
+      > /etc/apt/sources.list.d/adoptium.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends temurin-21-jre \
+ && rm -rf /var/lib/apt/lists/*
+
+# Solidity compilers. Clone Certora/cvt-executables-linux via the forwarded
+# SSH agent and copy out every solc* binary it ships.
+RUN --mount=type=ssh \
+    git clone --depth 1 git@github.com:Certora/cvt-executables-linux.git /tmp/cvt-solc \
+ && cp /tmp/cvt-solc/solc* /usr/local/bin/ \
+ && chmod 0755 /usr/local/bin/solc* \
+ && rm -rf /tmp/cvt-solc \
+ && ln -sf /usr/local/bin/solc8.29 /usr/local/bin/solc
+
+WORKDIR $AUTOPROVE_HOME
+
+# Bake the AI Autoprover source (build context = repo root) and install it.
+# This pulls ai-composer[ml,prover] @ composer-stable and certora-autosetup
+# transitively via the pinned URLs in pyproject.toml — no separate clones
+# of Autosetup/PreAudit, no manual prover-output-utility commit pinning.
+COPY . $AUTOPROVE_HOME/AIAutoProver
+
+RUN python -m venv $VIRTUAL_ENV \
+ && pip install --upgrade pip wheel setuptools
+
+RUN --mount=type=ssh \
+    pip install -e "$AUTOPROVE_HOME/AIAutoProver"
+
+# Extras the setup-db `composer.scripts.ragbuild` invocation needs (spacy +
+# bs4 + en_core_web_sm). Pinned versions match AIComposer's pyproject
+# [dependency-groups.ragbuild]; we install them at the top level so we can
+# invoke ragbuild with the venv's python directly — no uv runtime build,
+# no extra editable install dance.
+RUN pip install \
+    spacy==3.8.7 \
+    beautifulsoup4==4.13.5 \
+    "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl#sha256=1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85"
+
+# Pre-built CVL/prover HTML — ragbuild reads from here for the RAG DB.
+COPY --from=docs-builder /out/ $AUTOPROVE_HOME/prover-docs/
+
+# Pre-download the sentence-transformers embedding model so first runs are
+# offline-fast. nomic-embed-text-v1.5 ships custom modeling code, hence
+# trust_remote_code. Then chmod the cache subtree world-writable so the HF
+# library can drop `.no_exist` marker files at runtime.
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('nomic-ai/nomic-embed-text-v1.5', trust_remote_code=True)" \
+ && chmod -R go+rwX $HF_HOME
+
+# Trim build tooling now that wheels are installed.
+RUN apt-get purge -y build-essential libffi-dev curl gnupg \
+ && apt-get autoremove -y \
+ && rm -rf /var/lib/apt/lists/*
+
+# Database host/port assume the compose-managed postgres service; override
+# per-run if needed.
+ENV CERTORA_AI_COMPOSER_PGHOST=postgres \
+    CERTORA_AI_COMPOSER_PGPORT=5432
+
+COPY scripts/autoprove-entrypoint.sh /usr/local/bin/autoprove-entrypoint
+RUN chmod +x /usr/local/bin/autoprove-entrypoint
+
+# Final perms: make every baked thing under /opt/autoprove world-readable
+# so the runtime user (host UID supplied by compose) can read source, venv,
+# and HF cache. Also make /etc/passwd and /etc/group world-writable so the
+# entrypoint can append a synthetic passwd entry for whatever host UID the
+# container runs as — without it, libraries that call pwd.getpwuid() (e.g.
+# torch via getpass.getuser()) crash with `KeyError: 'getpwuid()'`. Done
+# LAST because earlier apt operations (notably the Temurin install creating
+# a system group) rewrite /etc/group and reset its perms.
+RUN chmod -R go+rX $AUTOPROVE_HOME \
+ && chmod 0666 /etc/passwd /etc/group
+
+WORKDIR /work
+
+ENTRYPOINT ["/usr/local/bin/autoprove-entrypoint"]
+CMD ["console-autoprove", "--help"]

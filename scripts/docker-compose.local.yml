@@ -1,20 +1,25 @@
-# docker-compose.yml — AI Autoprover containerized execution
+# docker-compose.local.yml — LOCAL bind-mount flow
+#
+# Pairs with scripts/Dockerfile.local. The autoprove service runs as the
+# host user, bind-mounts $HOST_WORK_DIR -> /work, and invokes
+# `console-autoprove` against that bind-mounted project.
 #
 # Bring up the persistent postgres:
-#   docker compose -f scripts/docker-compose.yml up -d postgres
+#   docker compose -f scripts/docker-compose.local.yml up -d postgres
 #
 # One-time DB schema + RAG/KB population (requires ANTHROPIC_API_KEY in env):
-#   docker compose -f scripts/docker-compose.yml --profile autoprove \
+#   docker compose -f scripts/docker-compose.local.yml --profile autoprove \
 #       run --rm autoprove setup-db
 #
-# Run autoprove ephemerally (the container is `--rm`'d on exit; postgres
-# keeps state in the `postgres_data` volume across container drops):
+# Run autoprove ephemerally:
 #   export HOST_UID=$(id -u) HOST_GID=$(id -g)
 #   export HOST_WORK_DIR=/path/to/your/project   # defaults to $PWD
-#   docker compose -f scripts/docker-compose.yml --profile autoprove \
+#   docker compose -f scripts/docker-compose.local.yml --profile autoprove \
 #       run --rm autoprove console-autoprove --cloud \
 #       /work/<project> /work/<project>/src/X.sol:X /work/<project>/docs/...
-name: autoprover
+#
+# For local AIComposer iteration overlay scripts/docker-compose.dev.yml.
+name: autoprover-local
 
 services:
   postgres:
@@ -55,10 +60,10 @@ services:
 
   autoprove:
     profiles: ["autoprove"]
-    image: aiautoprover:latest
+    image: aiautoprover-local:latest
     build:
       context: ..
-      dockerfile: scripts/Dockerfile.autoprove
+      dockerfile: scripts/Dockerfile.local
       ssh:
         - default
     depends_on:
