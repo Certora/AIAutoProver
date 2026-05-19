@@ -44,7 +44,6 @@ This brings up only the persistent postgres service. The `autoprove` service is 
 After postgres is up and the image is built, populate the databases. The `setup-db` subcommand applies the schema (via psql against the in-image `init-db.sql` shipped by `ai-composer`), then populates `rag_db` and the LangGraph knowledge base:
 
 ```bash
-export ANTHROPIC_API_KEY=...
 docker compose -f scripts/docker-compose.yml --profile autoprove \
     run --rm autoprove setup-db
 ```
