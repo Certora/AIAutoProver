@@ -16,12 +16,21 @@ authors = [
 dependencies = [
     "ai-composer[ml,prover] @ git+ssh://git@github.com/Certora/AIComposer.git@composer-stable",
     "certora-autosetup @ git+ssh://git@github.com/Certora/Autosetup.git@546a88f42b133035e6e5467bc3b6033134cf9280",
-    "langchain-core<1.3.3"
+    "langchain-core<1.3.3",
+]
+
+[project.optional-dependencies]
+# Pulled in by the cloud Dockerfile via `pip install -e .[s3]`. Carries
+# boto3 transitively (~50MB) — the local Dockerfile skips this extra.
+s3 = [
+    "pydantic-settings",
+    "smart_open[s3]",
 ]
 
 [project.scripts]
 console-autoprove = "ai_autoprover.cli.console_autoprove:main"
 tui-autoprove = "ai_autoprover.cli.tui_autoprove:main"
+s3-autoprove = "ai_autoprover.cli.s3_autoprove:main"
 
 [tool.setuptools.packages.find]
 include = ["ai_autoprover*"]
