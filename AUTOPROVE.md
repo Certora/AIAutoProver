@@ -8,7 +8,7 @@ The image bakes in:
 
 - The Python venv with `ai-autoprover`, `ai-composer[ml,prover]`, and `certora-autosetup` installed (versions pinned by `pyproject.toml`)
 - Eclipse Temurin 21 JRE — used by `certora_cli` for local CVL syntax checking
-- `solc 0.8.29` as `/usr/local/bin/solc8.29` and `/usr/local/bin/solc`
+- The entire solidity compilers [collection](https://github.com/Certora/cvt-executables-linux); `solc` linked to `/usr/local/bin/solc8.29` as the default
 - The `nomic-embed-text-v1.5` sentence-transformer model
 - Pre-rendered CVL/prover documentation HTML, used by `setup-db` to populate `rag_db`
 
